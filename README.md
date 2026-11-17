@@ -7,6 +7,25 @@ filtreerib **ainult sinu valitud projektid** ja kirjutab **Google Sheetsi** ühe
 **Töötab macOS / Windows / Linux peal.** Jagatav: anna kaust edasi, iga inimene seadistab
 oma Google Sheeti ja jälgitavad projektid ise.
 
+## Codex token usage
+
+The token usage page also supports Codex desktop and CLI rollouts from
+`~/.codex/sessions`. The hourly job sends usage for configured projects through
+`/api/token-usage`; no server database migration is required. Use the AI filter
+`Codex` on the token usage page. To populate past completed hours, run
+`aitrack backfill --hours 24` (this also processes the normal hourly diary).
+
+Usage is calculated from cumulative `token_count` counters, with duplicate
+snapshots ignored and earlier events used as the time-window baseline. Cached
+input is separated from input, while reasoning is already included in output.
+Each increment uses its event time, model and reasoning effort from turn context.
+Unknown models, invalid counters and counter-reset events are skipped rather
+than estimated. The reader checks session project metadata before reading the
+body, stops if turn context leaves the configured projects, and does not read
+shared Codex history. Empty allowlists produce no Codex usage records.
+
+Tests: `python3 -m unittest test_codex_usage test_codex_desktop test_parallel_projects`.
+
 ## Nõuded
 - **Python 3.9+** (muud sõltuvused puuduvad — ainult standardteek)
 - Vähemalt üks AI-CLI kokkuvõtete tegemiseks: **`claude`**, **`codex`** või **`gemini`**

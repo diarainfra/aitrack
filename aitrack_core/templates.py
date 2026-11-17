@@ -1166,7 +1166,7 @@ tfoot td { border-top:2px solid var(--line); font-weight:700; }
     <label>Alates <input type="date" id="fromInput"></label>
     <label>Kuni <input type="date" id="toInput"></label>
     <label>Projekt <input id="projectInput" placeholder="kõik" autocomplete="off"></label>
-    <label>AI <input id="toolInput" placeholder="Pi / Claude" style="width:110px" autocomplete="off"></label>
+    <label>AI <input id="toolInput" placeholder="Pi / Claude / Codex" style="width:110px" autocomplete="off"></label>
     <label>Mudel <input id="modelInput" placeholder="kõik" style="width:150px" autocomplete="off"></label>
     <label id="userWrap" hidden>Kasutaja <input id="userInput" placeholder="kasutajanimi" style="width:120px" autocomplete="off"></label>
     <button onclick="load()">Näita</button>
@@ -1193,7 +1193,7 @@ tfoot td { border-top:2px solid var(--line); font-weight:700; }
         <tfoot id="rowsFoot"></tfoot>
       </table>
     </div>
-    <p class="hint">Reasoning = eraldi loetud thinking-tokenid (Pi). Claude arvestab thinking'u output'i sisse. "Kokku" = input + output + cache-in + cache-out (reasoning ei liideta topelt).</p>
+    <p class="hint">Reasoning = eraldi loetud thinking-tokenid (Pi / Codex). Claude ja Codex arvestavad thinking'u output'i sisse. "Kokku" = input + output + cache-in + cache-out (reasoning ei liideta topelt).</p>
   </section>
 </main>
 <script>

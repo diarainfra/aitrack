@@ -167,3 +167,102 @@ def read_messages(sessions: Path, history: Path, since: dt.datetime, is_user_pro
             if not duplicate:
                 messages.append(Message(sid, projects[sid], ts, 'user', text, 'history'))
     return _deduplicate(messages)
+
+
+def _scoped_objects(path, project_allowed):
+    """Read only metadata for rejected sessions; stop on a scope change.
+
+    readline avoids iterating the remaining body of rejected files. A bounded
+    first line also avoids consuming a malformed file as one giant metadata row.
+    """
+    if path.is_symlink() or any(p.is_symlink() for p in path.parents):
+        return
+    try:
+        with path.open(encoding='utf-8', errors='replace') as stream:
+            line = stream.readline(65537)
+            if len(line) > 65536:
+                return
+            item = json.loads(line)
+            if not isinstance(item, dict) or item.get('type') != 'session_meta':
+                return
+            payload = item.get('payload')
+            if not isinstance(payload, dict) or not project_allowed(payload.get('cwd')):
+                return
+            yield item
+            for line in stream:
+                try:
+                    item = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                payload = item.get('payload')
+                if item.get('type') in {'session_meta', 'turn_context'}:
+                    if not isinstance(payload, dict) or not project_allowed(payload.get('cwd')):
+                        return
+                yield item
+    except (OSError, ValueError, TypeError):
+        return
+
+
+def read_token_usage(sessions: Path, since: dt.datetime, project_allowed) -> list[dict]:
+    """Read scoped cumulative usage deltas without exporting conversation content.
+
+    Establish counters before applying the time window. Repeated token_count
+    snapshots are not new usage. Cached input is a subset of Codex input, and
+    reasoning is a subset of output, so neither may be added twice to totals.
+    """
+    fields = ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
+              'output_tokens', 'reasoning_output_tokens')
+    result = []
+    for path in sorted(sessions.rglob('rollout-*.jsonl')):
+        try:
+            if path.stat().st_mtime < since.timestamp() - 3600:
+                continue
+        except OSError:
+            continue
+        previous = None
+        cwd = model = level = ''
+        for item in _scoped_objects(path, project_allowed):
+            payload = item.get('payload')
+            if not isinstance(payload, dict):
+                continue
+            if item.get('type') == 'session_meta':
+                if _internal_session(payload):
+                    break
+                cwd = payload.get('cwd', '')
+            elif item.get('type') == 'turn_context':
+                cwd = payload.get('cwd', '')
+                model = str(payload.get('model') or '')
+                level = str(payload.get('effort') or payload.get('reasoning_effort') or '').lower()
+            elif item.get('type') == 'event_msg' and payload.get('type') == 'token_count':
+                info = payload.get('info')
+                total = info.get('total_token_usage') if isinstance(info, dict) else None
+                if not isinstance(total, dict):
+                    continue
+                try:
+                    current = tuple(int(total.get(k) or 0) for k in fields)
+                except (ValueError, TypeError, OverflowError):
+                    continue
+                if any(v < 0 for v in current):
+                    continue
+                baseline = previous or (0,) * len(fields)
+                previous = current
+                delta = tuple(a - b for a, b in zip(current, baseline))
+                # Counter resets cannot safely be attributed: establish a new baseline.
+                if any(v < 0 for v in delta) or not any(delta):
+                    continue
+                ts = _timestamp(item.get('timestamp'))
+                if ts is None or ts <= since or not model:
+                    continue
+                input_tokens, cached, written, output, reasoning = delta
+                if cached + written > input_tokens or reasoning > output:
+                    continue  # Unknown/inconsistent schema: do not invent usage.
+                thinking_level = '' if level in {'none', 'off'} else level
+                if reasoning and not thinking_level:
+                    thinking_level = 'on'
+                result.append(dict(tool='Codex', project=cwd, ts=ts, model=model,
+                                   thinking=bool(thinking_level), thinking_level=thinking_level,
+                                   input=input_tokens-cached-written, output=output,
+                                   cache_read=cached, cache_write=written, reasoning=reasoning))
+    return result
