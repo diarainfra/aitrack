@@ -43,6 +43,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aitrack_core.codex import read_messages as _read_codex_messages
+from aitrack_core.codex import read_token_usage as _read_codex_token_usage
 
 from aitrack_core.templates import (
     _account_page_html,
@@ -1708,9 +1709,23 @@ def pi_token_usage(since: dt.datetime) -> list[TokenUsageRecord]:
     return out
 
 
+def codex_token_usage(since: dt.datetime) -> list[TokenUsageRecord]:
+    """Read Codex token usage under the configured project allowlist."""
+    roots = load_projects()
+    if not roots:
+        return []
+
+    def project_allowed(cwd):
+        return (isinstance(cwd, str) and bool(cwd) and Path(cwd).is_absolute()
+                and match_project(cwd, roots) is not None)
+
+    return [TokenUsageRecord(**record) for record in _read_codex_token_usage(
+        CODEX_SESSIONS, since, project_allowed)]
+
+
 def collect_token_usage(since: dt.datetime) -> list[TokenUsageRecord]:
     """Kõigi harnesside PÄRIS token-kulu ühe akna kohta (alamagendid kaasa arvatud)."""
-    recs = claude_token_usage(since) + pi_token_usage(since)
+    recs = claude_token_usage(since) + codex_token_usage(since) + pi_token_usage(since)
     recs.sort(key=lambda r: r.ts)
     return recs
 
