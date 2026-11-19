@@ -43,7 +43,7 @@ Server (seis 2026-11-19; vana Hetzneri `aitrack.parkproduction.ee` / `ssh hetzne
 
 ```text
 ssh root@diarainfra.com          (Windowsis: Windowsi OpenSSH + ssh-agent; ligipääsu haldab Diara serverite paneel)
-/opt/aitrack                      git-repo (haru main); uuendatakse `git push`-iga arvutist, vt Deploy workflow
+/opt/aitrack                      git-repo (haru main, origin = github.com/diarainfra/aitrack), vt Deploy workflow
 https://aitrack.diarainfra.com
 container: aitrack-server         (docker compose, network_mode: host)
 server DB containeris: /data/server.db   (docker volume aitrack-data)
@@ -122,27 +122,30 @@ Praegune oodatud tulemus:
 128 läbitud, 0 ebaõnnestunud
 ```
 
-Deploy workflow. Server **ei pääse GitHubi** (TLS handshake GitHubiga katkeb, muu internet töötab), seega
-`git pull` serveris ei tööta. `/opt/aitrack` on git-repo, millel on `receive.denyCurrentBranch=updateInstead`:
-arvutist tehtud `git push` uuendab otse serveri tööpuud. `.env` on `.git/info/exclude`-s, seega jääb alles.
+Deploy workflow (`/opt/aitrack` on git-repo, `.env` on `.git/info/exclude`-s ja jääb alles):
 
 ```bash
 # 1. muudatus läbi PR-i main'i (repo: github.com/diarainfra/aitrack; vana parkkarl/aitrack suunab sinna)
-git checkout main && git pull
 
 # 2. varundus serveris (DB)
 ssh root@diarainfra.com "docker exec aitrack-server python -c 'import sqlite3;s=sqlite3.connect(\"/data/server.db\");d=sqlite3.connect(\"/data/server.db.bak-$(date +%Y%m%d)\");s.backup(d)'"
 
-# 3. saada kood ja käivita uuesti (Windowsis kasuta Windowsi OpenSSH-d, sest Git Bashi ssh-l pole võtit)
-git -c core.sshCommand="C:/Windows/System32/OpenSSH/ssh.exe" push root@diarainfra.com:/opt/aitrack main
-ssh root@diarainfra.com 'cd /opt/aitrack && git log --oneline -1 && git status --short && docker compose up -d --build'
+# 3. uuenda ja käivita uuesti
+ssh root@diarainfra.com 'cd /opt/aitrack && git pull --ff-only && git log --oneline -1 && docker compose up -d --build'
 
 # 4. kontroll
 curl -s -o /dev/null -w "%{http_code}\n" https://aitrack.diarainfra.com/login
 ```
 
-Kui `git push` keeldub („tööpuu pole puhas"), on keegi serveris faile käsitsi muutnud: vaata `git status` / `git diff`
-serveris ja vii muudatus enne PR-iga main'i. Serveris jooksva versiooni näeb: `ssh root@diarainfra.com 'cd /opt/aitrack && git log --oneline -1'`.
+Kui `git pull` keeldub, on keegi serveris faile käsitsi muutnud: vaata serveris `git status` / `git diff` ja vii
+muudatus enne PR-iga main'i. Varuvariant, kui GitHub pole serverist kättesaadav: repo lubab ka otse push'i
+(`receive.denyCurrentBranch=updateInstead`), nt Windowsist
+`git -c core.sshCommand="C:/Windows/System32/OpenSSH/ssh.exe" push root@diarainfra.com:/opt/aitrack main`.
+
+**DNS-i eripära selles serveris:** serveri nimi on `diarainfra.com`, mistõttu c-ares (curl, git) tuletas otsingudomeeniks
+`com`. IPv4-ainult saitide (nt `github.com`) AAAA päring langes siis `github.com.com` peale (Cloudflare) ja TLS katkes.
+Parandus: `/etc/resolv.conf` real `search .`, mida hoiab alles udhcpc hook `/etc/udhcpc/post-{bound,renew}/50-search-root`
+(→ `/usr/local/sbin/resolv-search-root`). Vana fail: `/etc/resolv.conf.bak-20261119`.
 
 Kliendid uuendavad end ise (`git reset --hard origin/main`), kui serveri `.env` `MIN_CLIENT_VERSION` on suurem kui
 nende `CLIENT_VERSION`. Kliendi muudatuse levitamiseks: tõsta `aitrack.py` `CLIENT_VERSION`, ühenda main'i, deploy
@@ -154,6 +157,7 @@ Viimased deployd:
 2026-11-19  main aa6d01c (PR #16–#20: Codexi token-kulu, brauseriaeg/aktiivsed minutid, emoji UTF-8 parandus), MIN_CLIENT_VERSION=11
             varundus: /opt/aitrack-files-bak-20261119.tar.gz, containeris /data/server.db.bak-20261119
 2026-11-19  /opt/aitrack muudetud git-repoks (main 23d3bd6); vana failikoopia: /opt/aitrack.old-20261119
+2026-11-19  serveri DNS parandatud (search .), git pull GitHubist töötab
 ```
 
 ### Mida mitte valesti mõista
