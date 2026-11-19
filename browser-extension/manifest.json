@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "aitrack brauseriaeg",
+  "version": "1.0.0",
+  "description": "Saadab aktiivse vahelehe minutid lokaalsele aitrackile. Andmed jäävad sinu arvutisse; aitrack arvestab ainult projektiga seotud aadresse.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAq1YNDjyg7TGdSqDrG4DHab549DN44KQTG7288kZslHfDevtqCBW8cspe7Blbb5mx38ozXW68ukZicuw1JTZPxxQemEcguyoK7geYnX1ZY/BiHEO2QjyrmARwG76sTmaBZIUAm91EtwZgzdsHgm0idnFLQ9Vx45rKf+M2K1ZSGuTLOPKivOYtsSOjY2S/TZdEkqqXqVdVmPQtRM0AV0Qt3o8Ck3v/a7NfT4279WOIwt26YLkHULFBOF3Ts6Od6QqsKBq/NTfKwRfKevkDhcpIUSeFSCvG1dBsTD8ptQtUofqtis6/wKE+lNlhZjBGXn59CC5Zx1LeZ98HSq3P+6oBPQIDAQAB",
+  "permissions": ["alarms", "idle", "tabs", "storage", "nativeMessaging"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

@@ -26,6 +26,29 @@ shared Codex history. Empty allowlists produce no Codex usage records.
 
 Tests: `python3 -m unittest test_codex_usage test_codex_desktop test_parallel_projects`.
 
+## Tegelikud aktiivsed minutid (peidetud, UI-s ei kuvata)
+
+Päevik loeb tunni aktiivseks juba ühe logikirje põhjal. Lisaks arvutab `aitrack run` iga
+(tund × projekt) kohta tegelikud aktiivsed minutid. Neid päevikus, CSV-s, Sheetsis ega veebivaates
+ei näidata; need lähevad serveri tabelisse `active_periods` (lokaalse/Sheets väljundi korral faili
+`~/.config/aitrack/active_periods.json`) ja on loetavad `GET /api/export/active-periods?from=&to=` kaudu.
+
+- **AI:** promptide ja vastuste ajatemplid; kuni 10-minutiline vahe loetakse pidevaks tööks, iga kirje järel 2 min.
+- **Brauser, ajaloofailid:** Chrome, Edge, Brave, Opera, Vivaldi, Chromium, Arc, Firefox ja Safari (macOS, vajab
+  Full Disk Accessi). Külastus on aktiivne kuni järgmise külastuseni samas brauseris, kõige rohkem 5 minutit.
+- **Brauser, laiendus (täpsem, valikuline):** topeltklõps `install-browser.bat` (Windows) /
+  `install-browser.command` (macOS) või `aitrack browser setup` seadistab ühenduse, avab laienduste lehe ja
+  annab kolmesammulise juhendi. Lihtne juhend: [browser-extension/JUHEND.md](browser-extension/JUHEND.md).
+  Serveri ühe käsuga install ja `aitrack setup` teevad selle ise. Laiendus salvestab iga minuti, mil brauser on
+  fookuses ja kasutaja pole jõude, ainult lokaalsesse faili.
+- **Ainult projektiga seotud lehed:** projekti Git remote (nt `github.com/org/repo`) loetakse automaatselt;
+  muud aadressid lisa käsuga `aitrack browser add localhost:3000 --project <tee>`. Muu brauseritegevus jääb
+  välja ja URL-e serverisse ei saadeta. Ülevaade: `aitrack browser status`.
+- **Kattuvusi ei teki:** AI- ja brauseriminutid ühendatakse minuti kaupa, nii et samal ajal toimunud tegevus
+  loetakse üks kord (`minutes` = ühend; `ai_minutes`, `browser_minutes`, `overlap_minutes` on eraldi teada).
+
+Testid: `python3 -m unittest test_browser_activity`.
+
 ## Nõuded
 - **Python 3.9+** (muud sõltuvused puuduvad — ainult standardteek)
 - Vähemalt üks AI-CLI kokkuvõtete tegemiseks: **`claude`**, **`codex`** või **`gemini`**
