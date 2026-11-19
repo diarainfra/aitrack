@@ -39,36 +39,26 @@ cmd_work / cmd_tick / cmd_serve / cmd_user / cmd_connect
 
 Uut API/DB tööd tehes lisa funktsioonid samasse serveri sektsiooni, lisa handlerisse endpoint ja lisa regressioonitest `aitrack_tests.py` lõppu uue TEST numbriga.
 
-Server on deploytud Hetznerisse:
+Server (seis 2026-11-19; vana Hetzneri `aitrack.parkproduction.ee` / `ssh hetzner-kool` ei ole enam kasutusel):
 
 ```text
-ssh hetzner-kool
-/opt/aitrack
-https://aitrack.parkproduction.ee
-container: aitrack-server
-server DB containeris: /data/server.db
+ssh root@diarainfra.com          (Windowsis: Windowsi OpenSSH + ssh-agent; ligipääsu haldab Diara serverite paneel)
+/opt/aitrack                      kood on kopeeritud failidena, SIIN EI OLE GIT REPOT
+https://aitrack.diarainfra.com
+container: aitrack-server         (docker compose, network_mode: host)
+server DB containeris: /data/server.db   (docker volume aitrack-data)
+/opt/aitrack/.env                 MIN_CLIENT_VERSION=<number>  (praegu 11)
 avalik route: Cloudflare -> http://127.0.0.1:3103
 ```
 
-Brauseri login on juba olemas:
+Brauseri login:
 
 ```text
-https://aitrack.parkproduction.ee/login
-https://aitrack.parkproduction.ee/activity
+https://aitrack.diarainfra.com/login
+https://aitrack.diarainfra.com/activity
 ```
 
-Praegu on serveri kasutaja:
-
-```text
-admin
-```
-
-Ära kirjuta paroole ega tokeneid reposse, plaani ega vestlusesse. Vajadusel on Hetzneris ainult rootile loetavad failid:
-
-```text
-/root/aitrack/admin-login.txt
-/root/aitrack/admin-token.txt
-```
+Kasutajaid on serveris 6 (sh admin). Ära kirjuta paroole ega tokeneid reposse, plaani ega vestlusesse.
 
 CLI/API jaoks jääb token-auth alles. Brauseri jaoks kasutatakse `HttpOnly` session-cookie't. Serveris on juba lihtne rate limiter ja IP-ban tüüpiliste probe'ide ning korduvate vale-loginite jaoks.
 
@@ -111,7 +101,7 @@ aitrack start
 aitrack serve --host 0.0.0.0 --port 8765 --db /data/server.db
 aitrack user add admin --role admin --db /data/server.db
 aitrack user password admin --db /data/server.db
-aitrack connect --url https://aitrack.parkproduction.ee --token TOKEN
+aitrack connect --url https://aitrack.diarainfra.com --token TOKEN
 aitrack project-id --json
 aitrack work start --tool pi "short summary"
 aitrack tick
@@ -132,13 +122,34 @@ Praegune oodatud tulemus:
 128 läbitud, 0 ebaõnnestunud
 ```
 
-Deploy workflow:
+Deploy workflow (serveris pole giti, seega kopeeritakse `main`-i failid):
 
 ```bash
-git add ...
-git commit -m "..."
-git push origin main
-ssh hetzner-kool 'cd /opt/aitrack && git pull --ff-only && docker compose up -d --build'
+# 1. muudatus läbi PR-i main'i (repo: github.com/diarainfra/aitrack; vana parkkarl/aitrack suunab sinna)
+git checkout main && git pull
+
+# 2. varundus serveris (DB + praegused failid)
+ssh root@diarainfra.com 'cd /opt && tar czf /opt/aitrack-files-bak-$(date +%Y%m%d).tar.gz --exclude="aitrack/*.bak*" aitrack'
+ssh root@diarainfra.com "docker exec aitrack-server python -c 'import sqlite3;s=sqlite3.connect(\"/data/server.db\");d=sqlite3.connect(\"/data/server.db.bak-$(date +%Y%m%d)\");s.backup(d)'"
+
+# 3. kopeeri kood (Dockerfile kasutab ainult aitrack.py, README.md, aitrack_core/)
+git archive --format=tar -o aitrack.tar main aitrack.py aitrack_core README.md
+scp aitrack.tar root@diarainfra.com:/tmp/
+ssh root@diarainfra.com 'cd /opt/aitrack && tar xf /tmp/aitrack.tar && rm /tmp/aitrack.tar && docker compose up -d --build'
+
+# 4. kontroll
+curl -s -o /dev/null -w "%{http_code}\n" https://aitrack.diarainfra.com/login
+```
+
+Kliendid uuendavad end ise (`git reset --hard origin/main`), kui serveri `.env` `MIN_CLIENT_VERSION` on suurem kui
+nende `CLIENT_VERSION`. Kliendi muudatuse levitamiseks: tõsta `aitrack.py` `CLIENT_VERSION`, ühenda main'i, deploy
+ning sea serveri `.env` failis `MIN_CLIENT_VERSION` samaks ja tee `docker compose up -d`.
+
+Viimased deployd:
+
+```text
+2026-11-19  main aa6d01c (PR #16–#20: Codexi token-kulu, brauseriaeg/aktiivsed minutid, emoji UTF-8 parandus), MIN_CLIENT_VERSION=11
+            varundus: /opt/aitrack-files-bak-20261119.tar.gz, containeris /data/server.db.bak-20261119
 ```
 
 ### Mida mitte valesti mõista
