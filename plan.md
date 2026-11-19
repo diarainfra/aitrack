@@ -43,7 +43,7 @@ Server (seis 2026-11-19; vana Hetzneri `aitrack.parkproduction.ee` / `ssh hetzne
 
 ```text
 ssh root@diarainfra.com          (Windowsis: Windowsi OpenSSH + ssh-agent; ligipääsu haldab Diara serverite paneel)
-/opt/aitrack                      kood on kopeeritud failidena, SIIN EI OLE GIT REPOT
+/opt/aitrack                      git-repo (haru main); uuendatakse `git push`-iga arvutist, vt Deploy workflow
 https://aitrack.diarainfra.com
 container: aitrack-server         (docker compose, network_mode: host)
 server DB containeris: /data/server.db   (docker volume aitrack-data)
@@ -122,24 +122,27 @@ Praegune oodatud tulemus:
 128 läbitud, 0 ebaõnnestunud
 ```
 
-Deploy workflow (serveris pole giti, seega kopeeritakse `main`-i failid):
+Deploy workflow. Server **ei pääse GitHubi** (TLS handshake GitHubiga katkeb, muu internet töötab), seega
+`git pull` serveris ei tööta. `/opt/aitrack` on git-repo, millel on `receive.denyCurrentBranch=updateInstead`:
+arvutist tehtud `git push` uuendab otse serveri tööpuud. `.env` on `.git/info/exclude`-s, seega jääb alles.
 
 ```bash
 # 1. muudatus läbi PR-i main'i (repo: github.com/diarainfra/aitrack; vana parkkarl/aitrack suunab sinna)
 git checkout main && git pull
 
-# 2. varundus serveris (DB + praegused failid)
-ssh root@diarainfra.com 'cd /opt && tar czf /opt/aitrack-files-bak-$(date +%Y%m%d).tar.gz --exclude="aitrack/*.bak*" aitrack'
+# 2. varundus serveris (DB)
 ssh root@diarainfra.com "docker exec aitrack-server python -c 'import sqlite3;s=sqlite3.connect(\"/data/server.db\");d=sqlite3.connect(\"/data/server.db.bak-$(date +%Y%m%d)\");s.backup(d)'"
 
-# 3. kopeeri kood (Dockerfile kasutab ainult aitrack.py, README.md, aitrack_core/)
-git archive --format=tar -o aitrack.tar main aitrack.py aitrack_core README.md
-scp aitrack.tar root@diarainfra.com:/tmp/
-ssh root@diarainfra.com 'cd /opt/aitrack && tar xf /tmp/aitrack.tar && rm /tmp/aitrack.tar && docker compose up -d --build'
+# 3. saada kood ja käivita uuesti (Windowsis kasuta Windowsi OpenSSH-d, sest Git Bashi ssh-l pole võtit)
+git -c core.sshCommand="C:/Windows/System32/OpenSSH/ssh.exe" push root@diarainfra.com:/opt/aitrack main
+ssh root@diarainfra.com 'cd /opt/aitrack && git log --oneline -1 && git status --short && docker compose up -d --build'
 
 # 4. kontroll
 curl -s -o /dev/null -w "%{http_code}\n" https://aitrack.diarainfra.com/login
 ```
+
+Kui `git push` keeldub („tööpuu pole puhas"), on keegi serveris faile käsitsi muutnud: vaata `git status` / `git diff`
+serveris ja vii muudatus enne PR-iga main'i. Serveris jooksva versiooni näeb: `ssh root@diarainfra.com 'cd /opt/aitrack && git log --oneline -1'`.
 
 Kliendid uuendavad end ise (`git reset --hard origin/main`), kui serveri `.env` `MIN_CLIENT_VERSION` on suurem kui
 nende `CLIENT_VERSION`. Kliendi muudatuse levitamiseks: tõsta `aitrack.py` `CLIENT_VERSION`, ühenda main'i, deploy
@@ -150,6 +153,7 @@ Viimased deployd:
 ```text
 2026-11-19  main aa6d01c (PR #16–#20: Codexi token-kulu, brauseriaeg/aktiivsed minutid, emoji UTF-8 parandus), MIN_CLIENT_VERSION=11
             varundus: /opt/aitrack-files-bak-20261119.tar.gz, containeris /data/server.db.bak-20261119
+2026-11-19  /opt/aitrack muudetud git-repoks (main 23d3bd6); vana failikoopia: /opt/aitrack.old-20261119
 ```
 
 ### Mida mitte valesti mõista
