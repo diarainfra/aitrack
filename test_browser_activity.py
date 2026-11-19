@@ -237,5 +237,20 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(out["rows"][0]["periods"], [{"start": t(10, 0).isoformat(), "end": t(10, 10).isoformat()}])
 
 
+class SummarizerEncodingTests(unittest.TestCase):
+    def test_emoji_and_estonian_letters_survive_summarizer_pipe(self):
+        """Windowsis oli vaikimisi cp1252: emoji promptis kukutas tunnijooksu ja õ/ä moonutati."""
+        import sys
+        reply = "OBJEKT: Õun ✅\nSAAVUTUS: Tehtud\nTAKISTUS: Ei olnud\nTEADMINE: Ei olnud\n"
+        # Lapsprotsess loeb stdin'i UTF-8-na (nagu claude CLI) ja kirjutab UTF-8 vastuse.
+        script = ("import sys; data = sys.stdin.buffer.read().decode('utf-8'); "
+                  "assert '\\u2705' in data, 'emoji puudub'; "
+                  f"sys.stdout.buffer.write({reply!r}.encode('utf-8'))")
+        with patch.object(A, "resolve_engine", return_value=("claude", sys.executable)), \
+             patch.object(A, "_engine_cmd", side_effect=lambda e, x, prompt, m: ([sys.executable, "-c", script], prompt)):
+            item = A.summarize(["valmis ✅ õnnestus"], "proj", "10:00–11:00", A.load_config())
+        self.assertIn("Õun", item["objekt"])
+
+
 if __name__ == "__main__":
     unittest.main()
