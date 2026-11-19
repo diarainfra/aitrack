@@ -1878,6 +1878,7 @@ def summarize(prompts: list[str], project_label: str, hour_label: str, cfg: dict
     try:
         res = subprocess.run(
             cmd, input=stdin_text, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",  # Windowsi vaikekodeering (cp1252) ei mahuta emojisid/täpitähti
             timeout=int(cfg.get("summarizer", {}).get("timeout", 120)),
             cwd=tempfile.gettempdir(),
         )
@@ -8264,6 +8265,7 @@ def _generate_day_summary(date: str, rows: list[dict], cfg: dict) -> tuple[str, 
     try:
         res = subprocess.run(
             cmd, input=stdin_text, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",  # Windowsi vaikekodeering (cp1252) ei mahuta emojisid/täpitähti
             timeout=int(cfg.get("summarizer", {}).get("timeout", 120)),
             cwd=tempfile.gettempdir(),
         )
