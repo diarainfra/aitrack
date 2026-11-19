@@ -40,8 +40,10 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 from zoneinfo import ZoneInfo
 
+from aitrack_core import browser as _browser
 from aitrack_core.codex import read_messages as _read_codex_messages
 from aitrack_core.codex import read_token_usage as _read_codex_token_usage
 
@@ -79,6 +81,8 @@ STATE_FILE = CONFIG_DIR / "state.json"
 LOG_FILE = CONFIG_DIR / "aitrack.log"
 LOCK_FILE = CONFIG_DIR / "aitrack.lock"
 NOTES_FILE = CONFIG_DIR / "notes.jsonl"  # käsitsi lisatud tunnimärkmed (aitrack note)
+BROWSER_ACTIVITY_FILE = CONFIG_DIR / "browser_activity.jsonl"  # brauseri laienduse minutiproovid (ainult lokaalne)
+ACTIVE_PERIODS_FILE = CONFIG_DIR / "active_periods.json"  # peidetud tunni aktiivsed minutid (lokaalne/Sheets režiim)
 CLIENT_FILE = CONFIG_DIR / "client.json"  # selle arvuti püsiv client_id serveri jaoks
 LOCAL_DB = CONFIG_DIR / "local.db"  # lokaalse agendi SQLite DB (aktiivsed work_session'id + outbox)
 WORK_STATE_FILE = CONFIG_DIR / "work-state.json"  # legacy snapshot aktiivsetest work_session'idest
@@ -217,6 +221,11 @@ DEFAULT_CONFIG = {
     # "full" = saada ka prompt_text (debug/ümbertöötlemine); "off" = ära saada prompt-evente.
     "server_prompt_events": "metadata",
     "max_catchup_hours": 48,
+    # Peidetud aktiivsete minutite arvestus (UI-s ei kuvata): AI-logide ajatemplid + brauser.
+    # urls: {"<projekti tee>": ["github.com/org/repo", "localhost:3000", ...]} — ainult need
+    # aadressid loetakse projekti tööks; Git remote (nt github.com/org/repo) lisatakse automaatselt.
+    "browser": {"enabled": True, "history": True, "extension": True, "visit_minutes": 5,
+                "ai_gap_minutes": 10, "ai_tail_minutes": 2, "extension_keep_days": 14, "urls": {}},
 }
 
 
@@ -835,7 +844,8 @@ def _self_update_from_official_repo() -> bool:
         except OSError:
             pass
         ext = subprocess.run(
-            [sys.executable, "-c", "import aitrack; print(aitrack._install_pi_extension())"],
+            [sys.executable, "-c", "import aitrack; print(aitrack._install_pi_extension()); "
+             "aitrack._install_browser_native_host() if (aitrack.CONFIG_DIR / 'browser-host').exists() else None"],
             cwd=str(root), capture_output=True, text=True, timeout=30,
         )
         if ext.returncode != 0:
@@ -2401,6 +2411,25 @@ def _db_init(path: Path) -> None:
         );
         CREATE INDEX IF NOT EXISTS token_usage_user_date_idx ON token_usage(user_id, date, hour);
         CREATE INDEX IF NOT EXISTS token_usage_user_model_idx ON token_usage(user_id, model);
+        CREATE TABLE IF NOT EXISTS active_periods (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          hour_utc TEXT NOT NULL,
+          date TEXT NOT NULL,
+          hour TEXT NOT NULL,
+          project_key TEXT NOT NULL,
+          project TEXT NOT NULL DEFAULT '',
+          minutes INTEGER NOT NULL DEFAULT 0,
+          ai_minutes INTEGER NOT NULL DEFAULT 0,
+          browser_minutes INTEGER NOT NULL DEFAULT 0,
+          overlap_minutes INTEGER NOT NULL DEFAULT 0,
+          browsers TEXT NOT NULL DEFAULT '',
+          periods TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(user_id, hour_utc, project_key)
+        );
+        CREATE INDEX IF NOT EXISTS active_periods_user_date_idx ON active_periods(user_id, date);
         CREATE TABLE IF NOT EXISTS day_summaries (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -5062,6 +5091,97 @@ def _db_ingest_token_usage(path: Path, token: str, rows: list[dict]) -> dict:
     return {"ok": True, "stored": stored}
 
 
+def _db_ingest_active_periods(path: Path, token: str, rows: list[dict]) -> dict:
+    """Peidetud tunni aktiivsed minutid (AI ∪ brauser). Upsert (kasutaja × UTC-tund × projekt).
+
+    Ainult allowlistis projektid; perioodid lõigatakse tunni piiridesse ja minutid arvutatakse
+    serveris perioodidest uuesti, et kattuvusi ega üle 60 minuti tunde ei tekiks."""
+    _db_init(path)
+    now = _now_utc().isoformat()
+    stored = skipped = 0
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            hstart = parse_iso(str(r.get("hour_utc") or ""))
+            project_key = str(r.get("project_key") or "").strip()[:300]
+            date = str(r.get("date") or "").strip()
+            if not hstart or not project_key or not _valid_date(date):
+                skipped += 1
+                continue
+            hstart = hour_floor(hstart.astimezone(dt.timezone.utc))
+            hend = hstart + dt.timedelta(hours=1)
+            ident = {"project": {"project_key": project_key, "local_path": str(r.get("local_path") or "")}}
+            if not _db_project_allowed_conn(conn, int(user["id"]), ident):
+                skipped += 1
+                continue
+            minutes_set: set[int] = set()
+            raw_periods = r.get("periods") if isinstance(r.get("periods"), list) else []
+            for item in raw_periods[:120]:
+                if not isinstance(item, dict):
+                    continue
+                ps, pe = parse_iso(str(item.get("start") or "")), parse_iso(str(item.get("end") or ""))
+                if not ps or not pe:
+                    continue
+                minutes_set |= _browser.span_minutes(max(ps, hstart), min(pe, hend))
+            periods = [{"start": a.isoformat(), "end": b.isoformat()} for a, b in _browser.minutes_to_periods(minutes_set)]
+
+            def _n(key: str) -> int:
+                try:
+                    return max(0, min(60, int(r.get(key) or 0)))
+                except (TypeError, ValueError):
+                    return 0
+            browsers = r.get("browsers") if isinstance(r.get("browsers"), list) else []
+            conn.execute(
+                "INSERT INTO active_periods (user_id, hour_utc, date, hour, project_key, project, minutes, ai_minutes, "
+                " browser_minutes, overlap_minutes, browsers, periods, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, hour_utc, project_key) DO UPDATE SET date=excluded.date, hour=excluded.hour, "
+                " project=excluded.project, minutes=excluded.minutes, ai_minutes=excluded.ai_minutes, "
+                " browser_minutes=excluded.browser_minutes, overlap_minutes=excluded.overlap_minutes, "
+                " browsers=excluded.browsers, periods=excluded.periods, updated_at=excluded.updated_at",
+                (int(user["id"]), hstart.isoformat(), date, str(r.get("hour") or "")[:20], project_key,
+                 str(r.get("project") or "")[:200], len(minutes_set), _n("ai_minutes"), _n("browser_minutes"),
+                 _n("overlap_minutes"), ",".join(str(b)[:40] for b in browsers[:10]),
+                 json.dumps(periods), now, now),
+            )
+            stored += 1
+    return {"ok": True, "stored": stored, "skipped": skipped}
+
+
+def _db_export_active_periods(path: Path, token: str, q: dict) -> dict:
+    """API-eksport (aruannete jaoks); UI seda ei kuva."""
+    _db_init(path)
+    tz = _query_tzinfo(q)
+    today = _now_utc().astimezone(tz).date()
+    from_s, to_s = _qval(q, "from") or _qval(q, "start"), _qval(q, "to") or _qval(q, "end")
+    date_from = from_s if _valid_date(from_s) else today.replace(day=1).isoformat()
+    date_to = to_s if _valid_date(to_s) else today.isoformat()
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        target = _db_target_user_for_query(conn, user, q)
+        where, args = ["user_id = ?", "date >= ?", "date <= ?"], [int(target["id"]), date_from, date_to]
+        project_f = _qval(q, "project_key")
+        if project_f:
+            where.append("project_key = ?")
+            args.append(project_f)
+        rows = conn.execute("SELECT * FROM active_periods WHERE " + " AND ".join(where) +
+                            " ORDER BY hour_utc, project_key", args).fetchall()
+    out = []
+    for r in rows:
+        try:
+            periods = json.loads(r["periods"] or "[]")
+        except json.JSONDecodeError:
+            periods = []
+        out.append({"hour_utc": r["hour_utc"], "date": r["date"], "hour": r["hour"], "project_key": r["project_key"],
+                    "project": r["project"], "minutes": int(r["minutes"]), "ai_minutes": int(r["ai_minutes"]),
+                    "browser_minutes": int(r["browser_minutes"]), "overlap_minutes": int(r["overlap_minutes"]),
+                    "browsers": [b for b in str(r["browsers"] or "").split(",") if b], "periods": periods})
+    return {"ok": True, "user": target["name"], "period_from": date_from, "period_to": date_to,
+            "minutes": sum(x["minutes"] for x in out), "rows": out}
+
+
 def _db_token_usage_report(path: Path, token: str, q: dict | None = None) -> dict:
     """Perioodi token-kulu koondrida (projekt × AI × mudel × thinking) + kogusummad.
 
@@ -6298,6 +6418,146 @@ def _token_usage_rows(records: list[TokenUsageRecord], allow: list[str], *, grou
     return out
 
 
+_PROJECT_KEY_CACHE: dict[str, str] = {}
+
+
+def _project_key_cached(project_path: str) -> str:
+    key = _PROJECT_KEY_CACHE.get(project_path)
+    if key is None:
+        try:
+            key = str(_allowed_project_payload(project_path).get("project_key") or "")
+        except Exception:  # noqa: BLE001 - katkine git ei tohi tunnijooksu peatada
+            key = ""
+        if not key:
+            key = f"local:{Path(project_path).name.lower()}"
+        _PROJECT_KEY_CACHE[project_path] = key
+    return key
+
+
+def _browser_patterns(cfg: dict, allow: list[str], projects: Iterable[str]) -> dict[str, list[str]]:
+    """Projekt → brauseriaadresside mustrid. Ainult nendega sobiv brauseritegevus loetakse tööks."""
+    out: dict[str, list[str]] = {}
+    urls = (cfg.get("browser") or {}).get("urls") or {}
+    if isinstance(urls, dict):
+        for path, pats in urls.items():
+            proj = match_project(str(_resolve_path_loose(path)), allow)
+            if proj is None or not isinstance(pats, list):
+                continue
+            out.setdefault(proj, []).extend(str(x).strip() for x in pats if str(x).strip())
+    candidates = set(projects) | {x for x in (match_project(a, allow) for a in allow) if x}
+    for proj in candidates:
+        key = _project_key_cached(proj)
+        if key and not key.startswith("local:"):
+            out.setdefault(proj, []).append(key)   # nt github.com/org/repo → repo lehed, issue'd, PR-id
+    return out
+
+
+def _collect_browser_spans(cfg: dict, start: dt.datetime, end: dt.datetime) -> list:
+    bcfg = cfg.get("browser") or {}
+    if not bcfg.get("enabled", True):
+        return []
+    spans: list = []
+    visit_minutes = float(bcfg.get("visit_minutes", 5) or 5)
+    if bcfg.get("history", True):
+        sources = _browser.history_sources(HOME, _platform())
+        visits = _browser.read_history_visits(sources, start - dt.timedelta(minutes=visit_minutes), end, log=log)
+        spans.extend(_browser.visits_to_spans(visits, max_minutes=visit_minutes))
+    if bcfg.get("extension", True):
+        spans.extend(_browser.read_extension_spans(BROWSER_ACTIVITY_FILE, start, end))
+        _browser.prune_extension_log(BROWSER_ACTIVITY_FILE, int(bcfg.get("extension_keep_days", 14) or 14), _now_utc())
+    return spans
+
+
+def _active_period_rows(records: list, transcript_records: list, allow: list[str], cfg: dict, *,
+                        start: dt.datetime, end: dt.datetime, tz, browser_spans: list) -> list[dict]:
+    """Tunni × projekti tegelikud aktiivsed minutid: AI-minutid ∪ seotud brauseriminutid.
+
+    Kattuvad minutid (AI ja brauser samal ajal, või mitu brauserit korraga) loetakse üks kord.
+    Tulemus on peidetud arvestus — päevikusse/UI-sse seda ei kirjutata."""
+    bcfg = cfg.get("browser") or {}
+    ai_ts: dict[str, list[dt.datetime]] = {}
+    for r in list(records) + list(transcript_records):
+        if not (start <= r.ts < end):
+            continue
+        proj = match_project(r.project, allow)
+        if proj is not None:
+            ai_ts.setdefault(proj, []).append(r.ts)
+    ai_min = {p: _browser.ai_minutes(ts, gap_minutes=float(bcfg.get("ai_gap_minutes", 10) or 10),
+                                     tail_minutes=float(bcfg.get("ai_tail_minutes", 2) or 2))
+              for p, ts in ai_ts.items()}
+    patterns = _browser_patterns(cfg, allow, ai_ts.keys()) if browser_spans else {}
+    br_min: dict[str, set[int]] = {}
+    br_names: dict[str, set[str]] = {}
+    for span in browser_spans:
+        proj = _browser.assign_project(span.url, patterns)
+        if proj is None:
+            continue                                # projektiga mitteseotud leht → ei loeta
+        br_min.setdefault(proj, set()).update(_browser.span_minutes(span.start, span.end))
+        br_names.setdefault(proj, set()).add(span.browser)
+    lo, hi = int(start.timestamp() // 60), int(end.timestamp() // 60)
+    rows: list[dict] = []
+    for proj in sorted(set(ai_min) | set(br_min)):
+        a = {m for m in ai_min.get(proj, set()) if lo <= m < hi}
+        b = {m for m in br_min.get(proj, set()) if lo <= m < hi}
+        for hstart, mins in sorted(_browser.split_by_hour(a | b).items()):
+            ah, bh = a & mins, b & mins
+            local = hstart.astimezone(tz)
+            local_end = (hstart + dt.timedelta(hours=1)).astimezone(tz)
+            rows.append({
+                "hour_utc": hstart.isoformat(),
+                "date": local.strftime("%Y-%m-%d"),
+                "hour": f"{local.strftime('%H:%M')}–{local_end.strftime('%H:%M')}",
+                "project_key": _project_key_cached(proj),
+                "project": Path(proj).name,
+                "local_path": proj,
+                "minutes": len(mins),
+                "ai_minutes": len(ah),
+                "browser_minutes": len(bh),
+                "overlap_minutes": len(ah & bh),
+                "browsers": sorted(br_names.get(proj, set())) if bh else [],
+                "periods": [{"start": s_.isoformat(), "end": e_.isoformat()}
+                            for s_, e_ in _browser.minutes_to_periods(mins)],
+            })
+    return rows
+
+
+def _store_active_periods_local(rows: list[dict]) -> None:
+    """Lokaalse/Sheets väljundi puhul hoia minutid peidetud failis (upsert tunni × projekti võtmega)."""
+    data: dict = {}
+    if ACTIVE_PERIODS_FILE.exists():
+        try:
+            data = json.loads(ACTIVE_PERIODS_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    for r in rows:
+        data[f"{r['hour_utc']}|{r['project_key']}"] = r
+    _atomic_write_json(ACTIVE_PERIODS_FILE, data, mode=0o600)
+
+
+def _report_active_periods(records: list, transcript_records: list, allow: list[str], cfg: dict, *,
+                           start: dt.datetime, end: dt.datetime, tz) -> None:
+    try:
+        spans = _collect_browser_spans(cfg, start, end)
+        rows = _active_period_rows(records, transcript_records, allow, cfg, start=start, end=end,
+                                   tz=tz, browser_spans=spans)
+        if not rows:
+            return
+        if cfg.get("sink", {}).get("type") == "server":
+            body = _server_post("active-periods", {"periods": rows}, cfg)
+            if body and body.get("ok"):
+                log(f"run: {len(rows)} aktiivsete minutite rida saadetud → aitrack server")
+            else:
+                err = body.get("error") if isinstance(body, dict) else "server ei vastanud"
+                log(f"run: aktiivsete minutite saatmine ebaõnnestus: {err}")
+        else:
+            _store_active_periods_local(rows)
+            log(f"run: {len(rows)} aktiivsete minutite rida salvestatud ({ACTIVE_PERIODS_FILE.name})")
+    except Exception as e:  # noqa: BLE001 - minutiarvestus ei tohi päevikut murda
+        log(f"run: aktiivsete minutite arvestus ebaõnnestus: {e}")
+
+
 def _summary_inputs_from_transcript(items: list[tuple[TranscriptRecord, str]], *, limit: int = 80) -> list[str]:
     labels = {"user": "Kasutaja", "assistant": "AI"}
     out: list[str] = []
@@ -6488,6 +6748,9 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
                 log(f"run: {len(usage_rows)} token-kulu rida saadetud → aitrack server")
             elif body is not None:
                 log(f"run: token-kulu saatmine ebaõnnestus: {body.get('error') if isinstance(body, dict) else body}")
+
+    # Peidetud tegelikud aktiivsed minutid (AI ∪ brauser, kattuvused üks kord) — UI-s ei kuvata.
+    _report_active_periods(records, transcript_records, allow, cfg, start=last_hour, end=process_until, tz=tz)
 
     # Backfill on käsitsi taastamine/test — see EI tohi watermarki muuta (väldib hüppeid/vahelejätmist)
     if backfill_hours is None:
@@ -7573,6 +7836,9 @@ class _AitrackHandler(BaseHTTPRequestHandler):
             if u.path == "/api/export/work-sessions" and self._server_mode():
                 self._json(_db_export_work_sessions(self._db_path(), self._token(q), q))
                 return
+            if u.path == "/api/export/active-periods" and self._server_mode():
+                self._json(_db_export_active_periods(self._db_path(), self._token(q), q))
+                return
             if u.path == "/api/export/active-intervals" and self._server_mode():
                 self._json(_db_export_active_intervals(self._db_path(), self._token(q), q))
                 return
@@ -7670,6 +7936,10 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 keys = data.get("keys") if isinstance(data.get("keys"), list) else []
                 _db_ingest_rows(self._db_path(), self._token(data=data), rows, [str(k) for k in keys])
                 self._json({"ok": True})
+                return
+            if u.path == "/api/active-periods" and self._server_mode():
+                periods = data.get("periods") if isinstance(data.get("periods"), list) else []
+                self._json(_db_ingest_active_periods(self._db_path(), self._token(data=data), periods))
                 return
             if u.path == "/api/token-usage" and self._server_mode():
                 usage = data.get("usage") if isinstance(data.get("usage"), list) else []
@@ -8608,8 +8878,8 @@ else
   echo "NB! Projekti saad hiljem lisada: aitrack add /tee/projektini"
 fi
 
-echo "==> Paigaldan minute-trackingu ja Pi extensioni"
-"$PY" "$INSTALL_DIR/aitrack.py" install --minute-tracking --pi-extension
+echo "==> Paigaldan minute-trackingu, Pi extensioni ja brauseri laienduse ühenduse"
+"$PY" "$INSTALL_DIR/aitrack.py" install --minute-tracking --pi-extension --browser-extension
 
 echo ""
 echo "✓ aitrack on paigaldatud. Pi sees tee /reload või ava uus Pi sessioon."
@@ -8689,8 +8959,8 @@ def _install_client_ps1(base_url: str) -> str:
     Write-Host "NB! Projekti saad hiljem lisada: aitrack add C:\\tee\\projektini"
   }}
 
-  Write-Host "==> Paigaldan minute-trackingu ja Pi extensioni"
-  Invoke-Aitrack @("install", "--minute-tracking", "--pi-extension")
+  Write-Host "==> Paigaldan minute-trackingu, Pi extensioni ja brauseri laienduse ühenduse"
+  Invoke-Aitrack @("install", "--minute-tracking", "--pi-extension", "--browser-extension")
   Write-Host ""
   Write-Host "✓ aitrack on paigaldatud. Pi sees tee /reload või ava uus Pi sessioon."
 }}
@@ -8864,10 +9134,266 @@ def cmd_install(args, cfg):
         dst = _install_pi_extension()
         print(f"Pi extension paigaldatud: {dst}")
         print("Pi sees käivita /reload või ava uus pi session.")
+    if getattr(args, "browser_extension", False):
+        cmd_install_browser(args, cfg)
 
 
 def cmd_uninstall(args, cfg):
     uninstall_scheduler()
+    _uninstall_browser_native_host()
+
+
+# --- brauseri laiendus: native messaging host --------------------------------
+BROWSER_EXTENSION_DIR = THIS.parent / "browser-extension"
+_NATIVE_HOST_FILE = "com.aitrack.browser.json"
+_NATIVE_HOST_FIREFOX_FILE = "com.aitrack.browser.firefox.json"
+
+
+def cmd_browser_host() -> None:
+    """Brauser käivitab selle ise (native messaging). stdout on protokoll → mitte midagi muud printida."""
+    if _platform() == "windows":
+        import msvcrt  # noqa: PLC0415
+        msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+        msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+
+    def handle(msg: dict) -> dict:
+        if msg.get("type") == "ping":
+            return {"ok": True}
+        samples = msg.get("samples") if isinstance(msg.get("samples"), list) else []
+        try:
+            stored = _browser.append_extension_samples(BROWSER_ACTIVITY_FILE, samples[:5000])
+        except OSError as e:
+            return {"ok": False, "error": str(e)[:200]}
+        return {"ok": True, "stored": stored}
+
+    _browser.native_host_loop(sys.stdin.buffer, sys.stdout.buffer, handle)
+
+
+def _native_host_dirs() -> tuple[list[Path], list[Path]]:
+    """(Chromiumi manifesti kaustad, Firefoxi manifesti kaustad) macOS/Linux jaoks."""
+    if _platform() == "macos":
+        sup = HOME / "Library" / "Application Support"
+        chromium = [sup / "Google" / "Chrome", sup / "Microsoft Edge", sup / "Chromium",
+                    sup / "BraveSoftware" / "Brave-Browser", sup / "Vivaldi", sup / "Arc" / "User Data"]
+        return [d / "NativeMessagingHosts" for d in chromium if d.is_dir()], [sup / "Mozilla" / "NativeMessagingHosts"]
+    cfgd = HOME / ".config"
+    chromium = [cfgd / "google-chrome", cfgd / "microsoft-edge", cfgd / "chromium",
+                cfgd / "BraveSoftware" / "Brave-Browser", cfgd / "vivaldi"]
+    return [d / "NativeMessagingHosts" for d in chromium if d.is_dir()], [HOME / ".mozilla" / "native-messaging-hosts"]
+
+
+_WIN_CHROMIUM_KEYS = [r"Software\Google\Chrome", r"Software\Microsoft\Edge", r"Software\Chromium",
+                      r"Software\BraveSoftware\Brave-Browser", r"Software\Vivaldi"]
+_WIN_FIREFOX_KEY = r"Software\Mozilla"
+
+
+def _install_browser_native_host() -> list[str]:
+    """Registreeri native messaging host kõigile toetatud brauseritele. Tagastab tehtud sammud."""
+    host_dir = CONFIG_DIR / "browser-host"
+    host_dir.mkdir(parents=True, exist_ok=True)
+    if _platform() == "windows":
+        launcher = host_dir / "aitrack-browser-host.bat"
+        launcher.write_text(f'@echo off\r\n"{sys.executable}" "{THIS}" browser-host %*\r\n', encoding="utf-8", newline="")
+    else:
+        launcher = host_dir / "aitrack-browser-host"
+        launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{THIS}" browser-host "$@"\n', encoding="utf-8")
+        os.chmod(launcher, 0o755)
+    base = {"name": _browser.NATIVE_HOST_NAME, "description": "aitrack brauseriaeg", "path": str(launcher), "type": "stdio"}
+    chromium = {**base, "allowed_origins": [f"chrome-extension://{_browser.EXTENSION_ID}/"]}
+    firefox = {**base, "allowed_extensions": [_browser.FIREFOX_EXTENSION_ID]}
+    chromium_file, firefox_file = host_dir / _NATIVE_HOST_FILE, host_dir / _NATIVE_HOST_FIREFOX_FILE
+    chromium_file.write_text(json.dumps(chromium, indent=2), encoding="utf-8")
+    firefox_file.write_text(json.dumps(firefox, indent=2), encoding="utf-8")
+    done = [f"host: {launcher}"]
+    if _platform() == "windows":
+        import winreg  # noqa: PLC0415
+        for base_key, manifest in [(k, chromium_file) for k in _WIN_CHROMIUM_KEYS] + [(_WIN_FIREFOX_KEY, firefox_file)]:
+            sub = base_key + r"\NativeMessagingHosts" + "\\" + _browser.NATIVE_HOST_NAME
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, sub) as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, str(manifest))
+            done.append(f"register: HKCU\\{sub}")
+        return done
+    chromium_dirs, firefox_dirs = _native_host_dirs()
+    for d, manifest in [(d, chromium) for d in chromium_dirs] + [(d, firefox) for d in firefox_dirs]:
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{_browser.NATIVE_HOST_NAME}.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        done.append(f"manifest: {d}")
+    return done
+
+
+def _uninstall_browser_native_host() -> None:
+    if _platform() == "windows":
+        try:
+            import winreg  # noqa: PLC0415
+        except ImportError:
+            return
+        for base_key in _WIN_CHROMIUM_KEYS + [_WIN_FIREFOX_KEY]:
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
+                                 base_key + r"\NativeMessagingHosts" + "\\" + _browser.NATIVE_HOST_NAME)
+            except OSError:
+                pass
+    else:
+        chromium_dirs, firefox_dirs = _native_host_dirs()
+        for d in chromium_dirs + firefox_dirs:
+            (d / f"{_browser.NATIVE_HOST_NAME}.json").unlink(missing_ok=True)
+    shutil.rmtree(CONFIG_DIR / "browser-host", ignore_errors=True)
+
+
+# (nimi, laienduste lehe aadress, Windowsi/macOS/Linuxi käivitusfailid)
+_EXTENSION_BROWSERS = [
+    ("Chrome", "chrome://extensions",
+     [r"Google\Chrome\Application\chrome.exe"], "Google Chrome", ["google-chrome", "google-chrome-stable"]),
+    ("Edge", "edge://extensions",
+     [r"Microsoft\Edge\Application\msedge.exe"], "Microsoft Edge", ["microsoft-edge", "microsoft-edge-stable"]),
+    ("Brave", "brave://extensions",
+     [r"BraveSoftware\Brave-Browser\Application\brave.exe"], "Brave Browser", ["brave-browser", "brave"]),
+    ("Vivaldi", "vivaldi://extensions", [r"Vivaldi\Application\vivaldi.exe"], "Vivaldi", ["vivaldi"]),
+    ("Chromium", "chrome://extensions", [r"Chromium\Application\chrome.exe"], "Chromium", ["chromium", "chromium-browser"]),
+]
+
+
+def _find_extension_browsers() -> list[tuple[str, str, list[str]]]:
+    """Leia paigaldatud Chromiumi-põhised brauserid → [(nimi, laienduste leht, käivituskäsk)]."""
+    found: list[tuple[str, str, list[str]]] = []
+    plat = _platform()
+    for name, page, win_rel, mac_app, linux_cmds in _EXTENSION_BROWSERS:
+        cmd: list[str] | None = None
+        if plat == "windows":
+            roots = [os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+                     os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+                     os.environ.get("LOCALAPPDATA", str(HOME / "AppData" / "Local"))]
+            for root in roots:
+                for rel in win_rel:
+                    exe = Path(root) / rel
+                    if exe.is_file():
+                        cmd = [str(exe)]
+                        break
+                if cmd:
+                    break
+        elif plat == "macos":
+            if (Path("/Applications") / f"{mac_app}.app").is_dir():
+                cmd = ["open", "-a", mac_app]
+        else:
+            for c in linux_cmds:
+                exe = shutil.which(c)
+                if exe:
+                    cmd = [exe]
+                    break
+        if cmd:
+            found.append((name, page, cmd))
+    return found
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    plat = _platform()
+    candidates = ([["clip"]] if plat == "windows" else [["pbcopy"]] if plat == "macos"
+                  else [["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]])
+    for cmd in candidates:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            subprocess.run(cmd, input=text.encode("utf-8"), timeout=10, check=True)
+            return True
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return False
+
+
+def _browser_extension_guide(browser_name: str, page: str, copied: bool, opened: bool) -> str:
+    folder = str(BROWSER_EXTENSION_DIR)
+    lines = [
+        "",
+        f"Viimased 3 sammu {browser_name}is (ühekordne, ~30 sekundit):",
+        f"  1. {'Avasin sulle lehe' if opened else 'Ava aadressiribal'} {page}",
+        "  2. Lülita paremal üleval sisse 'Developer mode' (Arendaja režiim).",
+        "  3. Vajuta 'Load unpacked' (Laadi lahtipakitud) ja vali kaust:",
+        f"       {folder}",
+    ]
+    if copied:
+        lines.append("     (Kausta tee on juba lõikelaual: kausta valimise aknas kleebi see aadressiribale Ctrl+V / Cmd+V.)")
+    lines += [
+        "",
+        "Valmis! Laiendus hakkab minutid saatma kohe. Kontroll: aitrack browser status",
+        "Firefox ja Safari: laiendust pole vaja — nende aeg loetakse brauseri ajaloost automaatselt.",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_browser_setup(args, cfg) -> None:
+    """Kõik ühe käsuga: registreeri ühendus, kopeeri kausta tee, ava laienduste leht, prindi juhend."""
+    try:
+        _install_browser_native_host()
+        print("✓ Ühendus brauseri ja aitracki vahel on seadistatud.")
+    except Exception as e:  # noqa: BLE001
+        print(f"HOIATUS: ühenduse seadistamine ebaõnnestus: {e}")
+    browsers = _find_extension_browsers()
+    wanted = (getattr(args, "browser", None) or "").lower()
+    if wanted:
+        browsers = [b for b in browsers if b[0].lower() == wanted]
+    if not browsers:
+        print("Chrome'i/Edge'i/Brave'i ei leitud. Firefoxi ja Safari aeg loetakse ajaloost ilma laienduseta.")
+        print(f"Kui kasutad mõnd muud Chromiumi brauserit, laadi sinna kaust: {BROWSER_EXTENSION_DIR}")
+        return
+    name, page, cmd = browsers[0]
+    copied = _copy_to_clipboard(str(BROWSER_EXTENSION_DIR))
+    opened = False
+    if not getattr(args, "no_open", False):
+        try:
+            subprocess.Popen(cmd + [page], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            opened = True
+        except OSError:
+            opened = False
+    print(_browser_extension_guide(name, page, copied, opened))
+    others = [b[0] for b in browsers[1:]]
+    if others:
+        print(f"Ka {', '.join(others)} on olemas — sama laienduse saad sinna panna: aitrack browser setup --browser <nimi>")
+
+
+def cmd_browser(args, cfg):
+    bcfg = cfg.setdefault("browser", copy.deepcopy(DEFAULT_CONFIG["browser"]))
+    urls = bcfg.setdefault("urls", {})
+    allow = load_projects()
+    if args.browser_cmd in ("add", "remove"):
+        proj = match_project(str(_resolve_path_loose(args.project or ".")), allow)
+        if proj is None:
+            raise SystemExit("See kaust ei ole jälgitav projekt. Lisa enne päris terminalist: aitrack add <tee>")
+        pattern = _browser.normalize_url(args.pattern)
+        if not pattern:
+            raise SystemExit("Vigane aadress. Näide: github.com/org/repo või localhost:3000")
+        current = [x for x in urls.get(proj, []) if _browser.normalize_url(x) != pattern]
+        if args.browser_cmd == "add":
+            current.append(pattern)
+        if current:
+            urls[proj] = current
+        else:
+            urls.pop(proj, None)
+        save_config(cfg)
+        verb = "lisatud" if args.browser_cmd == "add" else "eemaldatud"
+        print(f"{pattern} {verb} projektile {Path(proj).name}")
+        return
+    if args.browser_cmd in ("install", "setup"):
+        cmd_browser_setup(args, cfg)
+        return
+    # status / list
+    print(f"Brauseriaja arvestus: {'sees' if bcfg.get('enabled', True) else 'väljas'} "
+          f"(ajalugu: {'jah' if bcfg.get('history', True) else 'ei'}, laiendus: {'jah' if bcfg.get('extension', True) else 'ei'})")
+    sources = _browser.history_sources(HOME, _platform())
+    print("Leitud ajaloofailid:" if sources else "Ajaloofaile ei leitud.")
+    for name, _kind, path in sources:
+        print(f"  {name:10} {path}")
+    ext = BROWSER_ACTIVITY_FILE
+    print(f"Laienduse logi: {'olemas' if ext.exists() else 'puudub (laiendus pole veel midagi saatnud)'}  {ext}")
+    print("Projekti aadressid (muu brauseritegevus jäetakse välja):")
+    patterns = _browser_patterns(cfg, allow, [])
+    if not patterns:
+        print("  (pole) — lisa: aitrack browser add github.com/org/repo --project <tee>")
+    for proj, pats in sorted(patterns.items()):
+        print(f"  {Path(proj).name}: {', '.join(dict.fromkeys(pats))}")
+
+
+def cmd_install_browser(args, cfg):
+    cmd_browser_setup(args, cfg)
 
 
 def _cli_base_cmd() -> str:
@@ -9089,6 +9615,9 @@ def _setup_flow() -> None:
     print("\nSeadistan tunniajasti...")
     install_scheduler()
 
+    if not input("\nKas seadistan brauseri laienduse (täpsem brauseriaeg Chrome/Edge/Brave)? [J/n]: ").strip().lower().startswith("n"):
+        cmd_browser_setup(argparse.Namespace(browser=None, no_open=False), cfg)
+
     if input("\nKas tahad iga õhtu kokkuvõtte-teavitust (18:00)? [j/N]: ").strip().lower().startswith("j"):
         install_digest_scheduler("18:00")
 
@@ -9104,6 +9633,9 @@ def _setup_flow() -> None:
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "browser-host":
+        cmd_browser_host()   # brauser kutsub; argparse't ei kasuta (brauser lisab omi argumente)
+        return
     cfg = load_config()
     p = argparse.ArgumentParser(
         prog="aitrack",
@@ -9142,6 +9674,19 @@ def main():
     tick = sub.add_parser("tick", help="saada kõigi aktiivsete work_session'ite minut serverisse")
     tick.add_argument("--session-id", help="saada tick ainult sellele sessioonile (serveri ws_... id või legacy number)")
     tick.set_defaults(fn=cmd_tick)
+
+    br = sub.add_parser("browser", help="brauseriaja arvestus: projekti aadressid ja allikate olek")
+    br_sub = br.add_subparsers(dest="browser_cmd")
+    br_sub.add_parser("status", help="näita ajaloofaile, laienduse olekut ja projekti aadresse")
+    for name in ("setup", "install"):
+        bs_ = br_sub.add_parser(name, help="seadista brauseri laiendus: ühendus + ava laienduste leht + juhend (ajastit ei muudeta)")
+        bs_.add_argument("--browser", help="Chrome, Edge, Brave, Vivaldi või Chromium (vaikimisi esimene leitud)")
+        bs_.add_argument("--no-open", action="store_true", help="ära ava brauserit, ainult prindi juhend")
+    for name, text in (("add", "loe see aadress projekti tööks"), ("remove", "eemalda aadress")):
+        bp = br_sub.add_parser(name, help=text)
+        bp.add_argument("pattern", help="nt github.com/org/repo, localhost:3000, docs.python.org")
+        bp.add_argument("--project", help="projekti kaust (vaikimisi praegune kaust)")
+    br.set_defaults(fn=cmd_browser, browser_cmd="status")
 
     wd = sub.add_parser("watchdog", help="märgi heartbeatita aktiivsed serveri sessioonid stale/stuck olekusse")
     wd.add_argument("--stale-minutes", type=int, default=DEFAULT_STALE_MINUTES, help=f"mitu minutit progressita tähendab stale (vaikimisi {DEFAULT_STALE_MINUTES})")
@@ -9317,6 +9862,7 @@ def main():
     inst = sub.add_parser("install", help="seadista OS-i tunniajasti (systemd/launchd/Task Scheduler)")
     inst.add_argument("--minute-tracking", action="store_true", help="lisa ka aitrack tick iga minuti timer aktiivsete work_session'ite jaoks")
     inst.add_argument("--pi-extension", action="store_true", help="paigalda globaalne Pi extension tool-call/raw-event trackinguks")
+    inst.add_argument("--browser-extension", action="store_true", help="registreeri brauseri laienduse native host (Chrome/Edge/Brave/Opera/Vivaldi/Firefox)")
     inst.set_defaults(fn=cmd_install)
     sub.add_parser("uninstall", help="eemalda ajasti").set_defaults(fn=cmd_uninstall)
     sub.add_parser("status", help="näita seadistust ja tuvastatud logiallikaid").set_defaults(fn=cmd_status)
