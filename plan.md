@@ -47,7 +47,7 @@ ssh root@diarainfra.com          (Windowsis: Windowsi OpenSSH + ssh-agent; ligip
 https://aitrack.diarainfra.com
 container: aitrack-server         (docker compose, network_mode: host)
 server DB containeris: /data/server.db   (docker volume aitrack-data)
-/opt/aitrack/.env                 MIN_CLIENT_VERSION=<number>  (praegu 11)
+/opt/aitrack/.env                 MIN_CLIENT_VERSION=<number>  (praegu 12)
 avalik route: Cloudflare -> http://127.0.0.1:3103
 ```
 
@@ -158,6 +158,7 @@ Viimased deployd:
             varundus: /opt/aitrack-files-bak-20261119.tar.gz, containeris /data/server.db.bak-20261119
 2026-11-19  /opt/aitrack muudetud git-repoks (main 23d3bd6); vana failikoopia: /opt/aitrack.old-20261119
 2026-11-19  serveri DNS parandatud (search .), git pull GitHubist töötab
+2026-11-20  main 3e9ccf5 (PR #24–#25: automaatne päevakokkuvõte pärast südaööd), MIN_CLIENT_VERSION=12; varundus /data/server.db.bak-20261120
 ```
 
 ### Mida mitte valesti mõista
