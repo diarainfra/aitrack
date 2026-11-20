@@ -221,6 +221,10 @@ DEFAULT_CONFIG = {
     # "full" = saada ka prompt_text (debug/ümbertöötlemine); "off" = ära saada prompt-evente.
     "server_prompt_events": "metadata",
     "max_catchup_hours": 48,
+    # Serverirežiimis: pärast südaööd koostatakse lõppenud päeva(de) tervikkokkuvõte automaatselt
+    # (ainult päevadele, millel on read ja millel kokkuvõtet veel pole; käsitsi tehtut üle ei kirjutata).
+    "auto_day_summary": True,
+    "auto_day_summary_lookback_days": 7,
     # Peidetud aktiivsete minutite arvestus (UI-s ei kuvata): AI-logide ajatemplid + brauser.
     # urls: {"<projekti tee>": ["github.com/org/repo", "localhost:3000", ...]} — ainult need
     # aadressid loetakse projekti tööks; Git remote (nt github.com/org/repo) lisatakse automaatselt.
@@ -6611,6 +6615,8 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
 
     if last_hour >= current_hour:
         log(f"run: pole uusi lõpetatud tunde (viimane={last_hour.isoformat()})")
+        if backfill_hours is None:
+            _auto_day_summaries(cfg, state, lock=lock)
         return
 
     # Piira järelejõudmise mahtu ühe käivituse kohta — pikk seisak ei tekita
@@ -6757,6 +6763,8 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
     if backfill_hours is None:
         state["last_processed_hour"] = process_until.isoformat()
         save_state(state)
+        # Pärast südaööd: eelmis(t)e päeva(de) tervikkokkuvõte serverisse (kui seda veel pole).
+        _auto_day_summaries(cfg, state, lock=lock)
 
 
 # --- platvormiülene ajasti seadistus ---------------------------------------
@@ -8276,6 +8284,55 @@ def _generate_day_summary(date: str, rows: list[dict], cfg: dict) -> tuple[str, 
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         log(f"day-summary: {engine} ebaõnnestus ({e}) — kasutan varvarianti")
     return _fallback_day_summary(date, rows), "fallback", ""
+
+
+def _auto_day_summaries(cfg: dict, state: dict, *, lock: Path | None = None) -> None:
+    """Koosta lõppenud päevade tervikkokkuvõtted automaatselt (tunnijooks kutsub pärast südaööd).
+
+    Vaatab viimased N päeva kuni eilseni. Päev, millel on juba kokkuvõte (nt käsitsi tehtud või
+    parandatud), jäetakse puutumata. Päev ilma ridadeta jäetakse vahele. Kui AI-mootor ebaõnnestub,
+    proovitakse järgmisel tunnil uuesti. Kontrollitud päevad jäetakse state'i meelde, et serverit
+    iga tund mitte asjata küsitleda."""
+    if not cfg.get("auto_day_summary", True) or cfg.get("sink", {}).get("type") != "server":
+        return
+    try:
+        tz = get_tz(cfg)
+        today = _now_utc().astimezone(tz).date()
+        lookback = max(1, int(cfg.get("auto_day_summary_lookback_days", 7) or 7))
+        done_until = dt.date.fromisoformat(str(state.get("day_summary_checked_until") or "1970-01-01"))
+        day = max(done_until + dt.timedelta(days=1), today - dt.timedelta(days=lookback))
+        while day < today:
+            date = day.isoformat()
+            existing = _server_get("day-summary", {"date": date}, cfg)
+            if not existing or not existing.get("ok"):
+                log(f"day-summary auto: serverist ei saanud {date} olekut — proovin hiljem")
+                return
+            if str((existing.get("summary") or {}).get("summary") or "").strip():
+                pass                                    # juba olemas → ära kirjuta üle
+            else:
+                body = _server_get("day", {"date": date}, cfg)
+                if not body or not body.get("ok"):
+                    log(f"day-summary auto: {date} päevavaadet ei saanud — proovin hiljem")
+                    return
+                rows = body.get("rows") if isinstance(body.get("rows"), list) else []
+                if rows:
+                    if lock is not None:
+                        heartbeat_lock(lock)
+                    summary, engine, model = _generate_day_summary(date, rows, cfg)
+                    if engine == "fallback" and resolve_engine(cfg)[0] != "none":
+                        log(f"day-summary auto: {date} AI-kokkuvõte ebaõnnestus — proovin järgmisel tunnil")
+                        return
+                    saved = _server_post("day-summary", {"date": date, "summary": summary,
+                                                         "source": f"aitrack auto ({engine})", "model": model}, cfg)
+                    if not saved or not saved.get("ok"):
+                        log(f"day-summary auto: {date} salvestamine ebaõnnestus — proovin hiljem")
+                        return
+                    log(f"day-summary auto: {date} kokkuvõte salvestatud serverisse")
+            state["day_summary_checked_until"] = date
+            save_state(state)
+            day += dt.timedelta(days=1)
+    except Exception as e:  # noqa: BLE001 - päevakokkuvõte ei tohi tunnijooksu murda
+        log(f"day-summary auto: ebaõnnestus: {e}")
 
 
 def cmd_day_summary(args, cfg):
