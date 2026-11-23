@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import faulthandler
 import csv
 import datetime as dt
 import getpass
@@ -188,6 +189,10 @@ _LOG_MAX = 5 * 1024 * 1024  # 5 MB
 def log(msg: str) -> None:
     stamp = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{stamp}] {msg}"
+    try:
+        _mark_progress()   # iga logirida = edenemine (valvur ei loe runi kinnijäänuks)
+    except NameError:
+        pass
     print(line, flush=True)
     try:
         _mkconfdir()
@@ -1184,6 +1189,14 @@ def acquire_lock(stale_seconds: int = LOCK_STALE_SECONDS) -> Path | None:
                 age = time.time() - LOCK_FILE.stat().st_mtime
             except OSError:
                 age = 0.0
+            owner = _lock_owner_pid()
+            if attempt == 0 and owner is not None and owner != os.getpid() and not _pid_alive(owner):
+                log(f"lock: luku omanik (pid {owner}) ei tööta enam — võtan üle")
+                try:
+                    LOCK_FILE.unlink()
+                except OSError:
+                    pass
+                continue
             if age > stale_seconds and attempt == 0:
                 log(f"lock: aegunud lukk ({int(age)}s) — võtan üle")
                 try:
@@ -1195,8 +1208,77 @@ def acquire_lock(stale_seconds: int = LOCK_STALE_SECONDS) -> Path | None:
     return None
 
 
+def _lock_owner_pid() -> int | None:
+    try:
+        return int(LOCK_FILE.read_text(encoding="utf-8").strip() or "0") or None
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Kas protsess töötab veel? Kahtluse korral True (siis kehtib tavaline aegumisreegel)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes  # noqa: PLC0415
+            k32 = ctypes.windll.kernel32
+            handle = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return k32.GetLastError() == 5              # ACCESS_DENIED → olemas, aga võõras
+            try:
+                code = ctypes.c_ulong()
+                if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return True
+                return code.value == 259                    # STILL_ACTIVE
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+RUN_STALL_SECONDS = 20 * 60   # nii kaua ilma edenemiseta → run loetakse kinnijäänuks
+_LAST_PROGRESS = [time.monotonic()]
+
+
+def _mark_progress() -> None:
+    _LAST_PROGRESS[0] = time.monotonic()
+
+
+def _start_run_watchdog(lock: Path | None, stall_seconds: int = RUN_STALL_SECONDS) -> threading.Event:
+    """Kui run ei edene stall_seconds jooksul: kirjuta kõigi lõimede virnajälg logisse,
+    vabasta lukk ja lõpeta protsess, et järgmine tunnijooks saaks kohe jätkata."""
+    stop = threading.Event()
+    _mark_progress()
+
+    def watch() -> None:
+        while not stop.wait(min(15.0, stall_seconds / 4)):
+            if time.monotonic() - _LAST_PROGRESS[0] < stall_seconds:
+                continue
+            try:
+                log(f"run: {stall_seconds // 60} min ilma edenemiseta — kirjutan virnajälje logisse ja lõpetan")
+                with LOG_FILE.open("a", encoding="utf-8") as f:
+                    faulthandler.dump_traceback(file=f, all_threads=True)
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                release_lock(lock)
+                os._exit(3)
+
+    threading.Thread(target=watch, name="aitrack-watchdog", daemon=True).start()
+    return stop
+
+
 def heartbeat_lock(lock: Path | None) -> None:
     """Värskenda luku mtime'i, et pikk run ei näiks teisele protsessile aegunud."""
+    _mark_progress()
     if lock:
         try:
             os.utime(lock, None)
@@ -1840,6 +1922,47 @@ def _parse_item(text: str, prompts: list[str]) -> dict:
     return {k: v[:400] for k, v in got.items()}
 
 
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Tapa protsess KOOS alamprotsessidega (claude CLI käivitab omakorda node-protsesse)."""
+    try:
+        if _platform() == "windows":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=15)
+        else:
+            os.killpg(proc.pid, 9)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _run_engine(cmd: list[str], stdin_text: str | None, timeout: int) -> subprocess.CompletedProcess:
+    """Nagu subprocess.run(timeout=...), aga aegumisel tapetakse kogu protsessipuu.
+
+    subprocess.run tapab aegumisel ainult otsese lapse ja ootab siis toru sulgumist; kui
+    lapselapsed hoiavad toru lahti (Windowsis tavaline), jääb see igaveseks ootama."""
+    kwargs: dict = {}
+    if _platform() == "windows":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace",  # cp1252 ei mahuta emojisid
+                            cwd=tempfile.gettempdir(), **kwargs)
+    try:
+        out, err = proc.communicate(stdin_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass                                    # torud jäid lahti — ära jää ootama
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
 def summarize(prompts: list[str], project_label: str, hour_label: str, cfg: dict) -> dict:
     """Tagasta ühe tunni kohta 4-väljaline dict (objekt/saavutus/takistus/teadmine)."""
     engine, exe = resolve_engine(cfg)
@@ -1880,12 +2003,7 @@ def summarize(prompts: list[str], project_label: str, hour_label: str, cfg: dict
     model = cfg.get("summarizer", {}).get("model", "")
     cmd, stdin_text = _engine_cmd(engine, exe, prompt, model)
     try:
-        res = subprocess.run(
-            cmd, input=stdin_text, capture_output=True, text=True,
-            encoding="utf-8", errors="replace",  # Windowsi vaikekodeering (cp1252) ei mahuta emojisid/täpitähti
-            timeout=int(cfg.get("summarizer", {}).get("timeout", 120)),
-            cwd=tempfile.gettempdir(),
-        )
+        res = _run_engine(cmd, stdin_text, int(cfg.get("summarizer", {}).get("timeout", 120)))
         text = (res.stdout or "").strip()
         if res.returncode == 0 and text:
             return _parse_item(text, prompts)
@@ -6584,9 +6702,11 @@ def run_once(cfg: dict, allow: list[str], backfill_hours: int | None = None) -> 
     if lock is None:
         log("run: teine aitrack-protsess juba töötab (lukk hõivatud) — väljun")
         return
+    watchdog = _start_run_watchdog(lock)
     try:
         _run_once_locked(cfg, allow, backfill_hours, lock)
     finally:
+        watchdog.set()
         release_lock(lock)
 
 
@@ -8271,12 +8391,7 @@ def _generate_day_summary(date: str, rows: list[dict], cfg: dict) -> tuple[str, 
     )
     cmd, stdin_text = _engine_cmd(engine, exe, prompt, model)
     try:
-        res = subprocess.run(
-            cmd, input=stdin_text, capture_output=True, text=True,
-            encoding="utf-8", errors="replace",  # Windowsi vaikekodeering (cp1252) ei mahuta emojisid/täpitähti
-            timeout=int(cfg.get("summarizer", {}).get("timeout", 120)),
-            cwd=tempfile.gettempdir(),
-        )
+        res = _run_engine(cmd, stdin_text, int(cfg.get("summarizer", {}).get("timeout", 120)))
         text = _clean_day_summary_text(res.stdout or "")
         if res.returncode == 0 and text:
             return text, engine, model
