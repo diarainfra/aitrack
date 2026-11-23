@@ -837,6 +837,21 @@ check("hook prompt-start peidab teksti metadata režiimis", hook_meta["prompt_te
 check("hook prompt-start full režiim on opt-in", hook_full["prompt_text"] == "salajane hook prompt")
 check("metadata režiim saadab prompti lõpus tehtu kokkuvõtte ja tokenite arvu", hook_done_meta["prompt_text"] == "" and hook_done_meta["work_summary"] == "Parandasin Activity vaate ja kontrollisin testidega." and hook_done_meta["payload"]["work_summary"] == hook_done_meta["work_summary"] and hook_done_meta["context_tokens"] == 3210)
 
+# ============ TEST 46E: päevavaate ajavöönd tuleb vaataja brauserist ============
+print("TEST 46E: ainult tuletatud ridadega päev kasutab brauseri ajavööndit, mitte serveri oma")
+utc_cfg = {"timezone": "UTC"}
+pi_event_utc = dt.datetime(2026, 11, 23, 7, 1, tzinfo=UTC)  # 09:01 Tallinnas (EET, +2)
+tz_browser = A._infer_fixed_tz_from_day_rows([], utc_cfg, {"tz": "Europe/Tallinn"})
+check("brauseri ajavöönd paneb pi tunni õigesse kohta", A._hour_label_from_local(A.hour_floor(pi_event_utc.astimezone(tz_browser))) == "09:00–10:00")
+check("GET päringu listikuju toimib", A._infer_fixed_tz_from_day_rows([], utc_cfg, {"tz": ["Europe/Tallinn"]}).utcoffset(pi_event_utc) == dt.timedelta(hours=2))
+check("ilma tz-ta jääb serveri ajavöönd", A._infer_fixed_tz_from_day_rows([], utc_cfg, None).utcoffset(pi_event_utc) == dt.timedelta(0))
+check("vigane tz langeb serveri ajavööndile", A._infer_fixed_tz_from_day_rows([], utc_cfg, {"tz": "Mars/Olympus"}).utcoffset(pi_event_utc) == dt.timedelta(0))
+saved_row = ["2026-11-23", "11:00–12:00", "o", "s", "t", "u", "Claude", "k:2026-11-23T09:00:00+00:00"]
+check("salvestatud ridade nihe on brauserist eespool", A._infer_fixed_tz_from_day_rows([saved_row], utc_cfg, {"tz": "Asia/Tokyo"}).utcoffset(pi_event_utc) == dt.timedelta(hours=2))
+manual_row = ["2026-11-23", "09:00–10:00", "o", "s", "t", "u", "Käsitsi", "k:2026-11-23|ui|abcdef0123456789"]
+check("käsitsi rea kuupäevavõti ei anna vale nihet (+9h)", A._infer_fixed_tz_from_day_rows([manual_row], utc_cfg, {"tz": "Europe/Tallinn"}).utcoffset(pi_event_utc) == dt.timedelta(hours=2))
+check("päevavaade saadab brauseri ajavööndi", "q.set('tz', browserTimeZone())" in start_page and "tz: browserTimeZone()" in start_page)
+
 # ============ TEST 47: brauseri login parool ja web session ============
 print("TEST 47: serveri brauseri login loob sessiooni ilma API tokenit avaldamata")
 ldb = CFG / "server-login-test.db"

@@ -4604,11 +4604,36 @@ def _rawish_day_text(value: str) -> bool:
     return len(text) > 250 and text.count(";") >= 3
 
 
-def _infer_fixed_tz_from_day_rows(rows: list[list], cfg: dict | None = None) -> dt.tzinfo:
+def _day_view_tz_from_query(q: dict | None) -> dt.tzinfo | None:
+    """Vaataja brauseri IANA-ajavöönd (?tz=Europe/Tallinn); None, kui puudub või on vigane."""
+    if not q:
+        return None
+    name = (_qval(q, "tz") or _qval(q, "timezone")).strip()
+    if not name or len(name) > 64:
+        return None
+    try:
+        return ZoneInfo(name)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _infer_fixed_tz_from_day_rows(rows: list[list], cfg: dict | None = None,
+                                  q: dict | None = None) -> dt.tzinfo:
+    """Päeva tuletatud ridade kuvamise ajavöönd.
+
+    Järjekord: (1) salvestatud ridade UTC-võtme ja tunnisildi vahe, (2) vaataja brauseri
+    ajavöönd, (3) serveri enda ajavöönd. Ilma (2)-ta said ainult tuletatud ridadega päevad
+    (nt Pi tunnid) serveri ajavööndi, mis ei pruugi kasutaja omaga klappida.
+    """
     for r in rows:
         if len(r) < 8:
             continue
-        started = parse_iso(str(r[7]).split("|", 1)[0].removeprefix("k:"))
+        stamp = str(r[7]).split("|", 1)[0].removeprefix("k:")
+        # Käsitsi ridade võti on 'k:YYYY-MM-DD|ui|...' (ainult kuupäev): see annaks
+        # nihkeks tunnisildi enda (nt +9h), seega arvesta ainult päris ajatemplitega võtmeid.
+        if "T" not in stamp:
+            continue
+        started = parse_iso(stamp)
         m = re.match(r"^(\d{2}):(\d{2})", str(r[1] or ""))
         if not started or not m:
             continue
@@ -4617,12 +4642,13 @@ def _infer_fixed_tz_from_day_rows(rows: list[list], cfg: dict | None = None) -> 
         offset_hours = round(offset_seconds / 3600)
         if -12 <= offset_hours <= 14:
             return dt.timezone(dt.timedelta(hours=offset_hours))
-    return get_tz(cfg or load_config())
+    return _day_view_tz_from_query(q) or get_tz(cfg or load_config())
 
 
 def _db_work_session_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date: str,
-                              existing_rows: list[list], cfg: dict | None = None) -> list[list]:
-    tz = _infer_fixed_tz_from_day_rows(existing_rows, cfg)
+                              existing_rows: list[list], cfg: dict | None = None,
+                              q: dict | None = None) -> list[list]:
+    tz = _infer_fixed_tz_from_day_rows(existing_rows, cfg, q)
     target = dt.date.fromisoformat(date)
     start_utc = dt.datetime.combine(target, dt.time.min, tzinfo=dt.timezone.utc) - dt.timedelta(hours=14)
     end_utc = dt.datetime.combine(target + dt.timedelta(days=1), dt.time.min, tzinfo=dt.timezone.utc) + dt.timedelta(hours=14)
@@ -4938,8 +4964,9 @@ def _placeholder_day_row(row: list) -> bool:
 
 
 def _db_prompt_event_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date: str,
-                              existing_rows: list[list], cfg: dict | None = None) -> list[list]:
-    tz = _infer_fixed_tz_from_day_rows(existing_rows, cfg)
+                              existing_rows: list[list], cfg: dict | None = None,
+                              q: dict | None = None) -> list[list]:
+    tz = _infer_fixed_tz_from_day_rows(existing_rows, cfg, q)
     target = dt.date.fromisoformat(date)
     start_utc = dt.datetime.combine(target, dt.time.min, tzinfo=dt.timezone.utc) - dt.timedelta(hours=14)
     end_utc = dt.datetime.combine(target + dt.timedelta(days=1), dt.time.min, tzinfo=dt.timezone.utc) + dt.timedelta(hours=14)
@@ -5082,9 +5109,9 @@ def _db_rows_for_day(path: Path, token: str, date: str, cfg: dict | None = None,
                  r["teadmine"], r["tool"], r["row_key"]] for r in rows_db]
         # Praktikapäeviku tekst peab eelistama tunni sisulisi AI-transkripte/prompt-evente.
         # Work-session/minute heartbeat on aja tõendus ja viimane fallback, mitte põhiline sõnastusallikas.
-        derived_prompts = _db_prompt_event_day_rows(conn, target_user, date, rows, cfg)
+        derived_prompts = _db_prompt_event_day_rows(conn, target_user, date, rows, cfg, q)
         rows = _merge_day_rows_with_work_sessions(rows, derived_prompts)
-        derived_work = _db_work_session_day_rows(conn, target_user, date, rows, cfg)
+        derived_work = _db_work_session_day_rows(conn, target_user, date, rows, cfg, q)
     return _merge_same_hour_day_rows(_merge_day_rows_with_work_sessions(rows, derived_work))
 
 
