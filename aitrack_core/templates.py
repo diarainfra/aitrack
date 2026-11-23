@@ -257,11 +257,15 @@ function renderDaySelect() {
   $('daySelect').onchange = () => { $('dateInput').value = $('daySelect').value; loadDay(); };
   $('dateInput').onchange = () => { currentDate = $('dateInput').value; $('daySelect').value = currentDate; loadDay(); };
 }
+function browserTimeZone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { return ''; }
+}
 async function loadDay() {
   currentDate = $('dateInput').value || currentDate;
   setStatus('Laen…');
   const q = userQueryParams();
   q.set('date', currentDate);
+  q.set('tz', browserTimeZone());
   const data = await api('/api/day?' + q.toString());
   renderRows(data.rows || []);
   await loadDaySummary();
@@ -277,7 +281,7 @@ async function saveDay(show=true) {
   currentDate = $('dateInput').value || currentDate;
   const rows = collectRows();
   setStatus('Salvestan…');
-  const body = {date: currentDate, rows};
+  const body = {date: currentDate, rows, tz: browserTimeZone()};
   if (selectedUserParam()) body.user = selectedUserParam();
   const data = await api('/api/day', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   renderRows(data.rows || []);
